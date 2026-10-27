@@ -1,0 +1,232 @@
+name: VOLT Free UGC Alerts
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preview = test without ping; check = check now; reward = announce a real reward'
+        type: choice
+        default: preview
+        options: [preview, check, reward]
+      release_id:
+        description: 'Reward only: stable unique release ID'
+        type: string
+      item_name:
+        description: 'Reward only: item name'
+        type: string
+      asset_id:
+        description: 'Reward only: Roblox asset ID'
+        type: string
+  repository_dispatch:
+    types: [ugc_reward, ugc_upload]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: volt-alert-delivery
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      GH_TOKEN: ${{ github.token }}
+      SEASON_ID: ${{ vars.SEASON_ID }}
+      SEASON_NAME: ${{ vars.SEASON_NAME }}
+      SEASON_END_UTC: ${{ vars.SEASON_END_UTC }}
+    steps:
+      - name: Check releases and deliver Discord alerts
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          """Standard-library-only alert checker, embedded in volt-alerts.yml."""
+          import base64
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          
+          
+          class ServiceError(Exception):
+              pass
+          
+          
+          def request(url, method='GET', data=None, headers=None):
+              req = urllib.request.Request(url, method=method,
+                  data=None if data is None else json.dumps(data).encode(),
+                  headers={'User-Agent': 'VOLT-LAB-Alerts/1.0', 'Content-Type': 'application/json', **(headers or {})})
+              try:
+                  with urllib.request.urlopen(req, timeout=25) as response:
+                      body = response.read()
+                      return json.loads(body) if body else {}
+              except urllib.error.HTTPError as exc:
+                  # Never print a request object or URL: Discord webhook URLs contain credentials.
+                  raise ServiceError(f'Remote request failed with HTTP {exc.code}') from None
+              except (urllib.error.URLError, TimeoutError):
+                  raise ServiceError('Remote request failed; check service availability') from None
+          
+          
+          def clean(value):
+              return str(value).replace('@', '@\u200b').replace('`', '').replace('*', '').replace('_', '').replace('[', '').replace(']', '')[:200]
+          
+          
+          class State:
+              def __init__(self, repo, branch, token):
+                  self.url = f'https://api.github.com/repos/{repo}/contents/volt-alert-state.json'
+                  self.branch = branch
+                  self.headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/vnd.github+json'}
+                  self.sha = None
+                  # Distinguish missing file from denied access; callers preflight the repository.
+                  try:
+                      file = request(self.url + '?' + urllib.parse.urlencode({'ref': branch}), headers=self.headers)
+                  except ServiceError as exc:
+                      if str(exc) != 'Remote request failed with HTTP 404':
+                          raise
+                      self.data = {'version': 1, 'baselines': [], 'sent': []}
+                  else:
+                      self.sha = file['sha']
+                      self.data = json.loads(base64.b64decode(file['content']))
+                      if self.data.get('version') != 1 or not isinstance(self.data.get('sent'), list):
+                          raise ServiceError('Unrecognized state file; restore a valid version, do not erase history')
+          
+              def save(self):
+                  payload = {'message': 'Record delivered UGC alerts', 'branch': self.branch,
+                             'content': base64.b64encode(json.dumps(self.data, indent=2).encode()).decode()}
+                  if self.sha:
+                      payload['sha'] = self.sha
+                  self.sha = request(self.url, 'PUT', payload, self.headers)['content']['sha']
+          
+          
+          def notify(state, key, title, body, webhook, asset=None, ping=True):
+              if key in state.data['sent']:
+                  return False
+              links = '[Play game](https://www.roblox.com/games/103922585645445)'
+              if asset:
+                  links += f' • [View item](https://www.roblox.com/catalog/{asset})'
+              request(webhook + '?wait=true', 'POST', {
+                  'username': 'VOLT Alerts', 'content': '@everyone' if ping else '',
+                  'allowed_mentions': {'parse': ['everyone'] if ping else []},
+                  'embeds': [{'title': title, 'description': body + '\n\n' + links, 'color': 9590783,
+                              'footer': {'text': 'VOLT LAB • Roll To Claim UGC'}}]})
+              state.data['sent'].append(key)
+              state.save()
+              return True
+          
+          
+          def catalog(group):
+              found, cursor, cursors = {}, None, set()
+              for _ in range(100):
+                  query = {'Category': 11, 'CreatorType': 2, 'CreatorTargetId': group,
+                           'Limit': 30, 'SortType': 3}
+                  if cursor:
+                      query['Cursor'] = cursor
+                  payload = request('https://catalog.roblox.com/v1/search/items/details?' + urllib.parse.urlencode(query))
+                  for item in payload['data']:
+                      if item.get('itemType') == 'Asset':
+                          found[str(item['id'])] = str(item['name'])
+                  cursor = payload.get('nextPageCursor')
+                  if not cursor:
+                      return found
+                  if cursor in cursors:
+                      raise ServiceError('Catalog pagination repeated; baseline left unchanged')
+                  cursors.add(cursor)
+                  time.sleep(0.25)
+              raise ServiceError('Catalog too large for this checker; baseline left unchanged')
+          
+          
+          def scan(state, webhook):
+              group = 1052554407
+              items = catalog(group)  # Never persist a partial scan.
+              marker = str(group)
+              if marker not in state.data['baselines']:
+                  state.data['sent'].extend(f'catalog:{group}:{asset}' for asset in items)
+                  state.data['baselines'].append(marker)
+                  state.save()
+                  print('Existing public accessories recorded silently. Future discoveries will alert.')
+                  return
+              for asset, name in items.items():
+                  notify(state, f'catalog:{group}:{asset}', '✨ New VOLT LAB UGC discovered!', clean(name), webhook, asset)
+          
+          
+          def seasons(state, webhook, sid, name, end, now=None):
+              if not end:
+                  return
+              if not sid or not name:
+                  raise ServiceError('Set SEASON_ID and SEASON_NAME alongside SEASON_END_UTC')
+              dt = datetime.fromisoformat(end.replace('Z', '+00:00'))
+              if dt.tzinfo is None:
+                  raise ServiceError('Season date needs a timezone offset, for example +00:00')
+              ends = int(dt.timestamp())
+              now = time.time() if now is None else now
+              if now >= ends:
+                  notify(state, f'season-end:{sid}', '🏁 Season ended!', f'**{clean(name)}** has ended.', webhook)
+              elif ends - now <= 86400:
+                  notify(state, f'season-warning:{sid}', '⏳ Season ending soon!',
+                         f'**{clean(name)}** ends <t:{ends}:R> — <t:{ends}:F>.', webhook)
+          
+          
+          def release(state, webhook, kind, payload):
+              rid, name, asset = payload.get('release_id'), payload.get('item_name'), payload.get('asset_id')
+              if not isinstance(rid, str) or not 0 < len(rid) <= 150 or not isinstance(name, str) or not 0 < len(name) <= 150:
+                  raise ServiceError('Release needs release_id and item_name, each 1–150 characters')
+              if not str(asset).isdigit() or int(asset) <= 0:
+                  raise ServiceError('Release needs a positive numeric asset_id')
+              title = '🎲 New UGC available in game!' if kind == 'reward' else '✨ New group UGC uploaded!'
+              key = f'reward:{rid}' if kind == 'reward' else f'catalog:1052554407:{int(asset)}'
+              notify(state, key, title, clean(name), webhook, str(asset))
+          
+          
+          def main():
+              with open(os.environ['GITHUB_EVENT_PATH']) as f:
+                  event = json.load(f)
+              repo = os.environ['GITHUB_REPOSITORY']
+              token = os.environ['GH_TOKEN']
+              metadata = request(f'https://api.github.com/repos/{repo}', headers={'Authorization': f'Bearer {token}'})
+              if metadata['private']:
+                  raise ServiceError('This free setup requires a PUBLIC repository. Private scheduled runs use limited minutes.')
+              state = State(repo, metadata['default_branch'], token)
+              webhook = os.environ.get('DISCORD_WEBHOOK_URL', '').strip().rstrip('/')
+              parsed = urllib.parse.urlsplit(webhook)
+              if parsed.scheme != 'https' or parsed.hostname != 'discord.com' or not parsed.path.startswith('/api/webhooks/') or parsed.query:
+                  raise ServiceError('Set a valid discord.com webhook URL in the DISCORD_WEBHOOK_URL Actions secret')
+              # Preflight writing state before sending any notification.
+              if state.sha is None:
+                  state.save()
+              inputs = event.get('inputs') or {}
+              mode = inputs.get('mode', 'preview')
+              trigger = os.environ['GITHUB_EVENT_NAME']
+              if trigger == 'workflow_dispatch' and mode == 'preview':
+                  notify(state, 'preview:' + os.environ['GITHUB_RUN_ID'], '🎲 VOLT Alerts are ready!',
+                         'Test message — no everyone ping. Group upload checks are ready to initialize.', webhook, ping=False)
+              if trigger == 'repository_dispatch':
+                  action = event.get('action')
+                  if action not in ('ugc_reward', 'ugc_upload'):
+                      raise ServiceError('Unsupported event')
+                  release(state, webhook, 'reward' if action == 'ugc_reward' else 'upload', event.get('client_payload') or {})
+              elif trigger == 'workflow_dispatch' and mode == 'reward':
+                  release(state, webhook, 'reward', inputs)
+              elif trigger == 'workflow_dispatch' and mode not in ('preview', 'check'):
+                  raise ServiceError('Unsupported manual mode')
+              # Always check seasons, even when Roblox is unavailable.
+              seasons(state, webhook, os.getenv('SEASON_ID', ''), os.getenv('SEASON_NAME', ''), os.getenv('SEASON_END_UTC', ''))
+              scan(state, webhook)
+              print('Alert check complete.')
+          
+          
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as exc:
+                  # Exception messages from this module are safe; avoid leaking raw URLs or headers.
+                  print('Alert run failed: ' + (str(exc) if isinstance(exc, ServiceError) else type(exc).__name__), file=sys.stderr)
+                  sys.exit(1)
+          PYTHON
