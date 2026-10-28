@@ -2,7 +2,7 @@ name: VOLT Free UGC Alerts
 
 on:
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: '2-59/5 * * * *'
   workflow_dispatch:
     inputs:
       mode:
@@ -17,7 +17,7 @@ on:
         description: 'Reward only: item name'
         type: string
       asset_id:
-        description: 'Reward only: Roblox asset ID'
+        description: 'Optional preview item ID, or required for reward'
         type: string
   repository_dispatch:
     types: [ugc_reward, ugc_upload]
@@ -60,12 +60,12 @@ jobs:
               pass
           
           
-          def request(url, method='GET', data=None, headers=None):
+          def request(url, method='GET', data=None, headers=None, timeout=25):
               req = urllib.request.Request(url, method=method,
                   data=None if data is None else json.dumps(data).encode(),
                   headers={'User-Agent': 'VOLT-LAB-Alerts/1.0', 'Content-Type': 'application/json', **(headers or {})})
               try:
-                  with urllib.request.urlopen(req, timeout=25) as response:
+                  with urllib.request.urlopen(req, timeout=timeout) as response:
                       body = response.read()
                       return json.loads(body) if body else {}
               except urllib.error.HTTPError as exc:
@@ -106,20 +106,101 @@ jobs:
                   self.sha = request(self.url, 'PUT', payload, self.headers)['content']['sha']
           
           
-          def notify(state, key, title, body, webhook, asset=None, ping=True):
+          def thumbnails(asset_ids):
+              """Batch real Roblox asset images; never hold up delivery for image generation."""
+              ids = list(dict.fromkeys(str(x) for x in asset_ids if str(x).isdigit()))
+              result = {}
+              for offset in range(0, len(ids), 100):
+                  batch = ids[offset:offset + 100]
+                  query = urllib.parse.urlencode({'assetIds': ','.join(batch), 'size': '420x420',
+                                                 'format': 'Png', 'isCircular': 'false', 'returnPolicy': 'PlaceHolder'})
+                  try:
+                      data = request('https://thumbnails.roblox.com/v1/assets?' + query, timeout=4)
+                      for item in data.get('data', []):
+                          url = item.get('imageUrl') or ''
+                          parsed = urllib.parse.urlsplit(url)
+                          host = parsed.hostname or ''
+                          if (item.get('state') == 'Completed' and parsed.scheme == 'https'
+                                  and (host == 'rbxcdn.com' or host.endswith('.rbxcdn.com'))
+                                  and str(item.get('targetId')) in batch):
+                              result[str(item['targetId'])] = url
+                  except (ServiceError, ValueError, TypeError, AttributeError):
+                      print('Thumbnail unavailable for now; the alert can still be delivered.')
+              return result
+          
+          
+          def card(key, title, body, asset=None, image_url=None):
+              reward = key.startswith('reward:')
+              upload = key.startswith('catalog:')
+              preview = key.startswith('preview:')
+              warning = key.startswith('season-warning:')
+              color = 0x38D9A9 if reward else 0xF4B942 if warning else 0x9257FF
+              label = ('AVAILABLE IN GAME' if reward else 'NEW GROUP UPLOAD' if upload
+                       else 'PREVIEW • NO PING' if preview else 'SEASON UPDATE')
+              embed = {
+                  'author': {'name': 'VOLT LAB  /  ' + label,
+                             'url': 'https://www.roblox.com/communities/1052554407'},
+                  'title': (body if asset else title)[:256],
+                  'url': f'https://www.roblox.com/catalog/{asset}' if asset else 'https://www.roblox.com/games/103922585645445',
+                  'description': ('A new reward is now available in **Roll To Claim UGC**.' if reward
+                                  else 'A new VOLT LAB accessory has been published. Check the item page for sale details.' if upload
+                                  else 'Example item card. This is a test, not a new reward announcement.' if preview
+                                  else body),
+                  'color': color,
+                  'fields': [{'name': 'Quick links', 'value':
+                              ('[View UGC](https://www.roblox.com/catalog/' + str(asset) + ')  •  ' if asset else '')
+                              + '[Play game](https://www.roblox.com/games/103922585645445)'}],
+                  'footer': {'text': 'VOLT ALERTS • Roll To Claim UGC'},
+                  'timestamp': datetime.now(timezone.utc).isoformat(),
+              }
+              if image_url:
+                  embed['image'] = {'url': image_url}
+              return embed
+          
+          
+          def notify(state, key, title, body, webhook, asset=None, ping=True, images=None):
               if key in state.data['sent']:
                   return False
-              links = '[Play game](https://www.roblox.com/games/103922585645445)'
+              image_url = None
               if asset:
-                  links += f' • [View item](https://www.roblox.com/catalog/{asset})'
-              request(webhook + '?wait=true', 'POST', {
+                  image_url = (thumbnails([asset]) if images is None else images).get(str(asset))
+              embed = card(key, title, body, asset, image_url)
+              message = request(webhook + '?wait=true', 'POST', {
                   'username': 'VOLT Alerts', 'content': '@everyone' if ping else '',
-                  'allowed_mentions': {'parse': ['everyone'] if ping else []},
-                  'embeds': [{'title': title, 'description': body + '\n\n' + links, 'color': 9590783,
-                              'footer': {'text': 'VOLT LAB • Roll To Claim UGC'}}]})
+                  'allowed_mentions': {'parse': ['everyone'] if ping else []}, 'embeds': [embed]})
               state.data['sent'].append(key)
+              # A newly uploaded item's image may still be rendering. Update the same card
+              # on a later check without another notification. No webhook secrets in state.
+              if asset and not image_url and str(message.get('id', '')).isdigit():
+                  state.data.setdefault('pending_images', {})[str(message['id'])] = {
+                      'asset': str(asset), 'embed': embed, 'attempts': 0}
               state.save()
               return True
+          
+          
+          def refresh_images(state, webhook):
+              pending = state.data.get('pending_images', {})
+              if not pending:
+                  return
+              images = thumbnails([record['asset'] for record in pending.values()])
+              for message_id, record in list(pending.items()):
+                  if not str(message_id).isdigit():
+                      continue
+                  image_url = images.get(record['asset'])
+                  if image_url:
+                      embed = dict(record['embed'], image={'url': image_url})
+                      try:
+                          request(webhook + '/messages/' + message_id, 'PATCH', {
+                              'embeds': [embed], 'allowed_mentions': {'parse': []}})
+                      except ServiceError:
+                          record['attempts'] += 1
+                      else:
+                          del pending[message_id]
+                  else:
+                      record['attempts'] += 1
+                  if message_id in pending and record['attempts'] >= 24:
+                      del pending[message_id]
+              state.save()
           
           
           def catalog(group):
@@ -153,8 +234,11 @@ jobs:
                   state.save()
                   print('Existing public accessories recorded silently. Future discoveries will alert.')
                   return
-              for asset, name in items.items():
-                  notify(state, f'catalog:{group}:{asset}', '✨ New VOLT LAB UGC discovered!', clean(name), webhook, asset)
+              new_items = {asset: name for asset, name in items.items()
+                           if f'catalog:{group}:{asset}' not in state.data['sent']}
+              images = thumbnails(new_items)
+              for asset, name in new_items.items():
+                  notify(state, f'catalog:{group}:{asset}', '✨ New VOLT LAB UGC discovered!', clean(name), webhook, asset, images=images)
           
           
           def seasons(state, webhook, sid, name, end, now=None):
@@ -205,20 +289,37 @@ jobs:
               mode = inputs.get('mode', 'preview')
               trigger = os.environ['GITHUB_EVENT_NAME']
               if trigger == 'workflow_dispatch' and mode == 'preview':
+                  asset = inputs.get('asset_id') or None
+                  name = clean(inputs.get('item_name') or 'VOLT Alerts are ready!')
+                  if asset and (not str(asset).isdigit() or int(asset) <= 0):
+                      raise ServiceError('Preview asset_id must be a positive number')
+                  if not asset:
+                      try:
+                          sample = request('https://catalog.roblox.com/v1/search/items/details?Category=11&CreatorType=2&CreatorTargetId=1052554407&Limit=10&SortType=3', timeout=5)
+                          item = next((x for x in sample.get('data', []) if x.get('itemType') == 'Asset'), None)
+                          if item:
+                              asset, name = str(item['id']), clean(item['name'])
+                      except (ServiceError, ValueError, TypeError, KeyError):
+                          pass
                   notify(state, 'preview:' + os.environ['GITHUB_RUN_ID'], '🎲 VOLT Alerts are ready!',
-                         'Test message — no everyone ping. Group upload checks are ready to initialize.', webhook, ping=False)
+                         name, webhook, asset=asset, ping=False)
+                  print('Preview sent without a ping. No live checks performed.')
+                  return
               if trigger == 'repository_dispatch':
                   action = event.get('action')
                   if action not in ('ugc_reward', 'ugc_upload'):
                       raise ServiceError('Unsupported event')
                   release(state, webhook, 'reward' if action == 'ugc_reward' else 'upload', event.get('client_payload') or {})
+                  return
               elif trigger == 'workflow_dispatch' and mode == 'reward':
                   release(state, webhook, 'reward', inputs)
+                  return
               elif trigger == 'workflow_dispatch' and mode not in ('preview', 'check'):
                   raise ServiceError('Unsupported manual mode')
               # Always check seasons, even when Roblox is unavailable.
               seasons(state, webhook, os.getenv('SEASON_ID', ''), os.getenv('SEASON_NAME', ''), os.getenv('SEASON_END_UTC', ''))
               scan(state, webhook)
+              refresh_images(state, webhook)
               print('Alert check complete.')
           
           
